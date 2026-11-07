@@ -2573,8 +2573,7 @@ class Scheduler(SchedulerInterface):
             prompt_token_id_logprobs = prompt_token_id_logprobs_dict.get(req_id)
             if should_emit_output:
                 # Add EngineCoreOutput for this Request.
-                outputs[request.client_index].append(
-                    EngineCoreOutput(
+                eco = EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
@@ -2586,19 +2585,18 @@ class Scheduler(SchedulerInterface):
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=prefill_stats,
-                        spec_decode_metrics=(
-                            request.spec_decode_metrics
-                            if finish_reason is not None
-                            else None
-                        ),
-                        kv_transfer_params=kv_transfer_params,
-                        ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         watermarking=watermarking,
                     )
-                )
+                if finish_reason is not None:
+                    # Set separately: more keyword arguments push this call
+                    # onto CPython's slow BUILD_MAP + CALL_FUNCTION_EX path.
+                    eco.spec_decode_metrics = request.spec_decode_metrics
+                    eco.kv_transfer_params = kv_transfer_params
+                    eco.ec_transfer_params = ec_transfer_params
+                outputs[request.client_index].append(eco)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
