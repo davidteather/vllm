@@ -11,11 +11,15 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
+    UnitaryKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -813,8 +817,26 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
 
         """
-        if self.enable_caching:
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+        if not self.enable_caching:
+            return
+        coordinator = self.coordinator
+        if type(coordinator) is UnitaryKVCacheCoordinator:
+            # Why: mirrors FullAttentionManager.cache_blocks' early return
+            # without the five-frame call chain, for the per-step decode case.
+            manager = coordinator.single_type_managers[0]
+            if (
+                type(manager) is FullAttentionManager
+                and manager.block_size == self.block_pool.hash_block_size
+            ):
+                num_cacheable = (
+                    num_computed_tokens - coordinator.num_reprefillable_tokens
+                )
+                num_hashed = len(request.block_hashes) * manager.block_size
+                if min(num_cacheable, num_hashed) // manager.block_size <= (
+                    manager.num_cached_block.get(request.request_id, 0)
+                ):
+                    return
+        coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
