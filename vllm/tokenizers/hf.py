@@ -3,10 +3,17 @@
 import contextlib
 import copy
 import queue
+from collections.abc import Callable
 from pathlib import Path
 from typing import TypeAlias, TypeVar
 
-from transformers import AutoTokenizer, PythonBackend, TokenizersBackend
+from tokenizers import Tokenizer
+from transformers import (
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+    PythonBackend,
+    TokenizersBackend,
+)
 
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_sentence_transformer_tokenizer_config
@@ -21,7 +28,7 @@ logger = init_logger(__name__)
 class ThreadSafeHFTokenizerMixin:
     """Mixin class for thread-safe HF fast tokenizers."""
 
-    pass
+    encode_fast: Callable[..., list[int] | None]
 
 
 def maybe_make_thread_pool(tokenizer: _T, copies: int = 1):
@@ -41,6 +48,12 @@ def maybe_make_thread_pool(tokenizer: _T, copies: int = 1):
         return tokenizer
 
     og_tokenizer = copy.copy(tokenizer)
+    can_encode_fast = (
+        isinstance(og_tokenizer._tokenizer, Tokenizer)
+        and type(og_tokenizer).__call__ is PreTrainedTokenizerBase.__call__
+        and type(og_tokenizer)._encode_plus is TokenizersBackend._encode_plus
+        and not hasattr(og_tokenizer, "_switch_to_input_mode")
+    )
 
     tokenizer_pool: queue.Queue[TokenizersBackend] = queue.Queue()
     for _ in range(copies):
@@ -93,6 +106,37 @@ def maybe_make_thread_pool(tokenizer: _T, copies: int = 1):
         def __call__(self, *args, **kwargs):
             with _borrow_from_pool() as tok:
                 return tok(*args, **kwargs)
+
+        def encode_fast(
+            self,
+            text: str,
+            add_special_tokens: bool = True,
+            truncation: bool = False,
+            max_length: int | None = None,
+        ) -> list[int] | None:
+            """``self(text, ...)["input_ids"]`` without computing offsets or a
+            ``BatchEncoding``; None when the result could differ."""
+            if not can_encode_fast:
+                return None
+            with _borrow_from_pool() as tok:
+                # Leave the backend as `set_truncation_and_padding` does for an
+                # untruncated, unpadded `__call__`.
+                backend = tok._tokenizer
+                if backend.truncation is not None:
+                    backend.no_truncation()
+                if backend.padding is not None:
+                    backend.no_padding()
+                if backend.encode_special_tokens != tok.split_special_tokens:
+                    backend.encode_special_tokens = tok.split_special_tokens
+                (encoding,) = backend.encode_batch_fast(
+                    [text], add_special_tokens=add_special_tokens
+                )
+                n_added = backend.num_special_tokens_to_add(False)
+            ids = encoding.ids
+            # HF truncation is a no-op unless this bound is exceeded.
+            if truncation and (max_length is None or len(ids) + n_added > max_length):
+                return None
+            return ids
 
         def __reduce__(self):
             return maybe_make_thread_pool, (og_tokenizer, copies)

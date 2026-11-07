@@ -27,6 +27,7 @@ from vllm.renderers.hf import (
     resolve_chat_template_kwargs,
     safe_apply_chat_template,
 )
+from vllm.renderers.params import TokenizeParams
 from vllm.tokenizers import get_tokenizer
 
 from ..models.registry import HF_EXAMPLE_MODELS
@@ -122,6 +123,34 @@ def test_apply_prompt_embeds_keeps_engine_token_ids_in_vocabulary() -> None:
             PlaceholderRange(offset=1, length=2),
             PlaceholderRange(offset=4, length=1),
         ]
+    finally:
+        renderer.shutdown()
+
+
+def test_tokenize_prompt_matches_hf_after_truncated_request() -> None:
+    """Untruncated prompts get HF ``__call__`` ids even after a truncated
+    request left truncation enabled on every pooled backend copy."""
+    model = "Qwen/Qwen3-0.6B"
+    model_config = ModelConfig(model)
+    tokenizer = get_tokenizer(model)
+    renderer = HfRenderer(VllmConfig(model_config=model_config), tokenizer)
+    text = "  <|im_start|>user\nhéllo 世界 🎉<|im_end|>\n "
+    try:
+        for _ in range(2 * (model_config.renderer_num_workers + 1)):
+            renderer.tokenize_prompt(
+                {"prompt": text},
+                TokenizeParams(max_total_tokens=None, truncate_prompt_tokens=3),
+            )
+        for add_special_tokens in (True, False):
+            params = TokenizeParams(
+                max_total_tokens=model_config.max_model_len,
+                add_special_tokens=add_special_tokens,
+            )
+            expected = tokenizer(text, add_special_tokens=add_special_tokens)
+            assert renderer.tokenize_prompt({"prompt": text}, params) == {
+                "prompt": text,
+                "prompt_token_ids": expected["input_ids"],
+            }
     finally:
         renderer.shutdown()
 
