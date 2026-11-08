@@ -1169,6 +1169,10 @@ class FlashAttentionImpl(AttentionImpl):
         self.supports_quant_query_input = flash_attn_supports_quant_query_input() and (
             not uses_sm90_fa4_fp8_kv_dequant
         )
+        # FA2 never reads descales and FA3/FA4 read them only for FP8 inputs.
+        self.needs_descale = (
+            is_quantized_kv_cache(self.kv_cache_dtype) or not current_platform.is_cuda()
+        )
         if uses_sm90_fa4_fp8_kv_dequant and self.dcp_world_size > 1:
             # DCP context attention is non-causal, which the SM90 FP8 MMA
             # kernel rejects at dispatch time.
@@ -1317,14 +1321,19 @@ class FlashAttentionImpl(AttentionImpl):
         block_table = attn_metadata.block_table
         scheduler_metadata = attn_metadata.scheduler_metadata
 
-        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-        q_descale = (
-            self._descale(layer._q_scale, layer._q_scale_float, descale_shape)
-            if self.supports_quant_query_input
-            else None
-        )
-        k_descale = self._descale(layer._k_scale, layer._k_scale_float, descale_shape)
-        v_descale = self._descale(layer._v_scale, layer._v_scale_float, descale_shape)
+        q_descale = k_descale = v_descale = None
+        if self.needs_descale:
+            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+            if self.supports_quant_query_input:
+                q_descale = self._descale(
+                    layer._q_scale, layer._q_scale_float, descale_shape
+                )
+            k_descale = self._descale(
+                layer._k_scale, layer._k_scale_float, descale_shape
+            )
+            v_descale = self._descale(
+                layer._v_scale, layer._v_scale_float, descale_shape
+            )
 
         if self.dcp_world_size > 1:
             self._forward_with_dcp(

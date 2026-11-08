@@ -968,6 +968,70 @@ def test_flash_attn_fa4_unit_fp8_descale_is_exact(default_vllm_config):
 
 
 @pytest.mark.skipif(
+    not current_platform.is_device_capability_family(90),
+    reason="FA3 runs on Hopper.",
+)
+def test_flash_attn_fa3_unquantized_kv_cache_passes_no_descale(default_vllm_config):
+    """FA3 reads descales only for FP8 inputs, so FlashAttentionImpl passes
+    none for an unquantized KV cache."""
+    from vllm.v1.attention.backends.fa_utils import (
+        flash_attn_varlen_func,
+        is_fa_version_supported,
+    )
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+
+    if not is_fa_version_supported(3):
+        pytest.skip("FA3 is not supported.")
+    set_random_seed(0)
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    seq_lens, q_len = [1328, 523, 2011], 3
+    num_heads, num_kv_heads, head_size = 64, 4, 128
+    impl = FlashAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+    assert not impl.needs_descale
+
+    q = torch.randn(
+        len(seq_lens) * q_len, num_heads, head_size, device=device
+    ).bfloat16()
+    k_cache, v_cache = (
+        torch.randn(64, 128, num_kv_heads, head_size, device=device).bfloat16()
+        for _ in range(2)
+    )
+    block_table = torch.randperm(64, dtype=torch.int32, device=device)[:48]
+
+    def run(descale: torch.Tensor | None) -> torch.Tensor:
+        return flash_attn_varlen_func(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=torch.arange(
+                0, q.shape[0] + 1, q_len, dtype=torch.int32, device=device
+            ),
+            seqused_k=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            max_seqlen_q=q_len,
+            max_seqlen_k=max(seq_lens),
+            softmax_scale=head_size**-0.5,
+            causal=True,
+            block_table=block_table.view(len(seq_lens), -1),
+            fa_version=3,
+            q_descale=descale,
+            k_descale=descale,
+            v_descale=descale,
+        )
+
+    # A non-unit descale leaves BF16 output unchanged: FA3 never reads it.
+    descale = torch.full((1,), 2.0, device=device).expand(len(seq_lens), num_kv_heads)
+    torch.testing.assert_close(run(None), run(descale), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
 )
