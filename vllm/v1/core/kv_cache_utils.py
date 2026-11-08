@@ -647,6 +647,13 @@ def generate_block_hash_extra_keys(
         A tuple of extra keys and the next multi-modal index.
 
     """
+    if not (
+        request.mm_features or request.lora_request or request.prompt_embeds is not None
+    ):
+        if start_token_idx == 0 and request.cache_salt:
+            return (("cache_salt", request.cache_salt),), start_mm_idx
+        return None, start_mm_idx
+
     mm_extra_keys: list[Any]
     mm_extra_keys, new_start_mm_idx = _gen_mm_extra_hash_keys(
         request, start_token_idx, end_token_idx, start_mm_idx
